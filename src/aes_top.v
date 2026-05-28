@@ -79,7 +79,7 @@ module aes_top (
 
     subbytes       sub (.state_in(aes_state), .state_out(sub_out));
     ShiftRows       sr (.state_in(sub_out),   .state_out(shift_out));
-    MixColumns_comb mc (.state_in(shift_out), .state_out(mix_out));
+    MixColumns mc (.state_in(shift_out), .state_out(mix_out));
 
     wire [127:0] std_out   = mix_out   ^ rk;  // standard round result (rounds 1–9)
     wire [127:0] final_out = shift_out ^ rk;  // final   round result (round 10)
