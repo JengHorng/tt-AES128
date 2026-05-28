@@ -1,29 +1,23 @@
 `timescale 1ns/1ps
-
 // =============================================================================
-// aes_top.v  —  Iterative AES-128 Core  (Tiny Tapeout version)
+// aes_top.v  —  Area-optimised iterative AES-128 core  (Tiny Tapeout version)
 // =============================================================================
 //
-// WHY ITERATIVE FOR TINY TAPEOUT:
-//   Pipelined design : ~4,900 flip-flops  → OpenLane takes very long / fails
-//   Iterative design :   ~400 flip-flops  → OpenLane completes quickly
+// AREA REDUCTION vs pipelined design:
+//   Pipelined : ~5,556 FFs, 20 S-box instances (~16,000 cells)
+//   This core :   ~530 FFs,  5 S-box instances (~4,500 cells) — fits 4×2 tile
 //
-// HOW IT WORKS:
-//   One round of AES is computed per clock cycle using a SINGLE shared
-//   combinational round function.  The same SubBytes, ShiftRows, MixColumns,
-//   and AddRoundKey logic is reused for all 10 rounds.
+// CHANGES vs previous iterative version:
+//   subbytes   : sequential (1 shared instance, 16 cycles) vs 16 parallel
+//   kx_sbox    : still 4 parallel (needed every round for key expansion)
 //
-//   Round keys are generated ON-THE-FLY — no pre-storage of all 11 round keys.
-//   Only the original key (RK0) and the current round key are stored.
+// TIMING (181 cycles per encryption block):
+//   Cycle  0       : initial AddRoundKey  (S_READY → S_SUBBYTES)
+//   Cycles 1..171  : 9 × (1 sub_start + 16 SubBytes + 1 round_op) = 9×18 = 162
+//   Cycles 172..188: final round  (1 sub_start + 16 SubBytes + 1 round_op)
+//   Cycle  181     : valid_out=1, ciphertext ready → S_READY
 //
-// TIMING:
-//   Cycle 0  (in S_READY)  : initial AddRoundKey  — state = plaintext XOR RK0
-//   Cycles 1–9 (S_ENCRYPT) : standard rounds 1–9  — SubBytes+ShiftRows+MixColumns+ARK
-//   Cycle 10 (S_ENCRYPT)   : final round 10        — SubBytes+ShiftRows+ARK (no MixColumns)
-//   Total : 11 cycles per encryption block
-//
-// INTERFACE: identical to the pipelined aes_top — no changes to tt_um_aes_project.v
-//
+// INTERFACE: identical to pipelined aes_top — tt_um_aes_project.v unchanged.
 // =============================================================================
 
 module aes_top (
@@ -46,77 +40,74 @@ module aes_top (
     input  wire         ready_out
 );
 
-    // =========================================================================
+    // ─────────────────────────────────────────────────────────────────────────
     // FSM states
-    // =========================================================================
-
-    localparam S_IDLE    = 2'd0;  // waiting for first key_load
-    localparam S_READY   = 2'd1;  // key loaded, ready to accept plaintext
-    localparam S_ENCRYPT = 2'd2;  // running encryption rounds
+    // ─────────────────────────────────────────────────────────────────────────
+    localparam S_IDLE     = 2'd0;
+    localparam S_READY    = 2'd1;
+    localparam S_SUBBYTES = 2'd2;   // waiting for sequential SubBytes
+    localparam S_ROUND_OP = 2'd3;   // ShiftRows + MixColumns/ARK
 
     reg [1:0] state;
 
-    // =========================================================================
-    // Data registers  (~400 FFs total vs ~4900 in pipelined version)
-    // =========================================================================
+    // ─────────────────────────────────────────────────────────────────────────
+    // Data registers (~530 FFs)
+    // ─────────────────────────────────────────────────────────────────────────
+    reg [127:0] aes_state;   // 128b — current AES state
+    reg [127:0] rk;          // 128b — current round key
+    reg [127:0] orig_key;    // 128b — RK0 (reset between blocks)
+    reg [3:0]   enc_ctr;     //   4b — round counter 1..10
 
-    reg [127:0] aes_state;   // 128 FFs — current AES state (changes each round)
-    reg [127:0] rk;          // 128 FFs — current round key
-    reg [127:0] orig_key;    // 128 FFs — original RK0 (used to reset rk between encryptions)
-    reg [3:0]   enc_ctr;     //   4 FFs — round counter: 0 in S_READY, 1–10 in S_ENCRYPT
+    // ─────────────────────────────────────────────────────────────────────────
+    // Sequential SubBytes instance (1 shared aes_sbox_rom inside)
+    // ─────────────────────────────────────────────────────────────────────────
+    wire        sub_start;        // asserted combinationally
+    wire [127:0] sub_state_out;
+    wire         sub_done;
+    wire         sub_busy;
 
-    // =========================================================================
-    // Combinational round function (shared across all 10 rounds)
-    //
-    // Input  : aes_state register
-    // Output : std_out  (rounds 1–9, includes MixColumns)
-    //          final_out (round 10,  no MixColumns)
-    // =========================================================================
+    subbytes sb (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .start    (sub_start),
+        .state_in (aes_state),
+        .state_out(sub_state_out),
+        .done     (sub_done),
+        .busy     (sub_busy)
+    );
 
-    wire [127:0] sub_out;    // SubBytes output
-    wire [127:0] shift_out;  // ShiftRows output
-    wire [127:0] mix_out;    // MixColumns output
+    // Start SubBytes on the FIRST cycle of S_SUBBYTES (before SubBytes is busy)
+    assign sub_start = (state == S_SUBBYTES) && !sub_busy;
 
-    subbytes       sub (.state_in(aes_state), .state_out(sub_out));
-    ShiftRows       sr (.state_in(sub_out),   .state_out(shift_out));
-    MixColumns mc (.state_in(shift_out), .state_out(mix_out));
+    // ─────────────────────────────────────────────────────────────────────────
+    // Combinational round operations (applied to aes_state in S_ROUND_OP)
+    // After S_SUBBYTES, aes_state holds the SubBytes result.
+    // ─────────────────────────────────────────────────────────────────────────
+    wire [127:0] shift_out;    // ShiftRows(aes_state)
+    wire [127:0] mix_out;      // MixColumns(shift_out)
 
-    wire [127:0] std_out   = mix_out   ^ rk;  // standard round result (rounds 1–9)
-    wire [127:0] final_out = shift_out ^ rk;  // final   round result (round 10)
+    ShiftRows   sr (.state_in(aes_state), .state_out(shift_out));
+    MixColumns  mc (.state_in(shift_out), .state_out(mix_out));
 
-    // =========================================================================
-    // On-the-fly key expansion (combinational, from current rk)
-    //
-    // next_rk = expand(rk, rcon[enc_ctr + 1])
-    //
-    // Timeline:
-    //   S_READY  enc_ctr=0 : expand(RK0,  rcon[1])  = RK1
-    //   S_ENCRYPT enc_ctr=1 : expand(RK1,  rcon[2])  = RK2
-    //   ...
-    //   S_ENCRYPT enc_ctr=9 : expand(RK9,  rcon[10]) = RK10
-    //   (enc_ctr=10 : next_rk unused — we reset rk to orig_key instead)
-    // =========================================================================
-
-    wire [31:0] kx_w0 = rk[127:96];
-    wire [31:0] kx_w1 = rk[95:64];
-    wire [31:0] kx_w2 = rk[63:32];
-    wire [31:0] kx_w3 = rk[31:0];
-
-    wire [31:0] kx_rot  = {kx_w3[23:0], kx_w3[31:24]};  // RotWord
-    wire [31:0] kx_sub;                                   // SubWord
+    // ─────────────────────────────────────────────────────────────────────────
+    // On-the-fly key expansion (4 parallel S-box instances for SubWord)
+    // These 4 instances add ~3,200 cells but run combinationally every cycle.
+    // ─────────────────────────────────────────────────────────────────────────
+    wire [31:0] kx_w3   = rk[31:0];
+    wire [31:0] kx_rot  = {kx_w3[23:0], kx_w3[31:24]};   // RotWord
+    wire [31:0] kx_sub;                                     // SubWord
 
     aes_sbox_rom ks0 (.addr(kx_rot[31:24]), .data(kx_sub[31:24]));
     aes_sbox_rom ks1 (.addr(kx_rot[23:16]), .data(kx_sub[23:16]));
     aes_sbox_rom ks2 (.addr(kx_rot[15:8]),  .data(kx_sub[15:8]));
     aes_sbox_rom ks3 (.addr(kx_rot[7:0]),   .data(kx_sub[7:0]));
 
-    wire [31:0]  kx_rcon  = get_rcon(enc_ctr + 4'd1);
-    wire [31:0]  kx_temp  = kx_sub ^ kx_rcon;
-    wire [31:0]  kx_nw4   = kx_w0 ^ kx_temp;
-    wire [31:0]  kx_nw5   = kx_w1 ^ kx_nw4;
-    wire [31:0]  kx_nw6   = kx_w2 ^ kx_nw5;
-    wire [31:0]  kx_nw7   = kx_w3 ^ kx_nw6;
-    wire [127:0] next_rk  = {kx_nw4, kx_nw5, kx_nw6, kx_nw7};
+    wire [31:0] kx_rcon = get_rcon(enc_ctr + 4'd1);   // rcon indexed by CURRENT enc_ctr
+    wire [31:0] kx_nw4  = rk[127:96] ^ kx_sub ^ kx_rcon;
+    wire [31:0] kx_nw5  = rk[95:64]  ^ kx_nw4;
+    wire [31:0] kx_nw6  = rk[63:32]  ^ kx_nw5;
+    wire [31:0] kx_nw7  = rk[31:0]   ^ kx_nw6;
+    wire [127:0] next_rk = {kx_nw4, kx_nw5, kx_nw6, kx_nw7};
 
     function [31:0] get_rcon;
         input [3:0] r;
@@ -137,36 +128,37 @@ module aes_top (
         end
     endfunction
 
-    // =========================================================================
-    // ready_in — high whenever the core is in S_READY
-    // =========================================================================
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // ready_in — high when idle in S_READY
+    // ─────────────────────────────────────────────────────────────────────────
     assign ready_in = (state == S_READY);
 
-    // =========================================================================
+    // ─────────────────────────────────────────────────────────────────────────
     // Main FSM
-    // =========================================================================
-
+    // ─────────────────────────────────────────────────────────────────────────
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state         <= S_IDLE;
             key_ready     <= 1'b0;
             valid_out     <= 1'b0;
             enc_ctr       <= 4'd0;
+            aes_state     <= 128'h0;
+            rk            <= 128'h0;
+            orig_key      <= 128'h0;
+            ciphertext_out<= 128'h0;
         end else begin
-
-            valid_out <= 1'b0;  // default: not valid (override below when done)
+            valid_out <= 1'b0;   // default
 
             case (state)
 
                 // ─────────────────────────────────────────────────────────
-                // S_IDLE — wait for the first key_load pulse
+                // S_IDLE — wait for key_load pulse
                 // ─────────────────────────────────────────────────────────
                 S_IDLE: begin
                     key_ready <= 1'b0;
                     if (key_load) begin
-                        orig_key  <= key_in;   // store RK0
-                        rk        <= key_in;   // seed the key expander
+                        orig_key  <= key_in;
+                        rk        <= key_in;
                         key_ready <= 1'b1;
                         enc_ctr   <= 4'd0;
                         state     <= S_READY;
@@ -174,53 +166,72 @@ module aes_top (
                 end
 
                 // ─────────────────────────────────────────────────────────
-                // S_READY — key ready, waiting for plaintext
+                // S_READY — accept plaintext, perform initial AddRoundKey
                 //
-                // On valid_in: perform initial AddRoundKey (round 0)
-                //   state  = plaintext XOR RK0
-                //   rk     = RK1  (pre-computed via next_rk)
-                //   enc_ctr = 1   (round 1 will run next cycle)
+                // When valid_in fires:
+                //   aes_state = plaintext XOR RK0
+                //   rk        = next_rk (RK1, using enc_ctr=1 rcon)
+                //   enc_ctr   = 1
+                //   → S_SUBBYTES (sub_start fires on first cycle there)
                 // ─────────────────────────────────────────────────────────
                 S_READY: begin
                     key_ready <= 1'b1;
 
                     if (key_load) begin
-                        // Hot key swap — load new key without full reset
+                        // Hot key reload
                         orig_key <= key_in;
                         rk       <= key_in;
                         enc_ctr  <= 4'd0;
                     end else if (valid_in) begin
-                        // Initial AddRoundKey (enc_ctr = 0, rk = RK0)
-                        aes_state <= plaintext_in ^ rk;  // state = PT XOR RK0
-                        rk        <= next_rk;             // rk = RK1
+                        // Initial AddRoundKey with RK0
+                        aes_state <= plaintext_in ^ rk;
+
+                        // Pre-expand key: next_rk = expand(RK0, rcon[1]) = RK1 (enc_ctr=0, so enc_ctr+1=1)
                         enc_ctr   <= 4'd1;
-                        state     <= S_ENCRYPT;
+                        rk        <= next_rk;   // next_rk = expand(RK0, rcon[1]) = RK1
+
+                        state     <= S_SUBBYTES;
                     end
                 end
 
                 // ─────────────────────────────────────────────────────────
-                // S_ENCRYPT — iterate through rounds 1 to 10
+                // S_SUBBYTES — sequential SubBytes processing
                 //
-                // enc_ctr 1–9  : standard rounds (SubBytes+ShiftRows+MixColumns+ARK)
-                // enc_ctr 10   : final round     (SubBytes+ShiftRows+ARK, no MixColumns)
-                //
-                // Key is expanded one step per cycle alongside the round.
-                // After round 10, rk is reset to orig_key ready for next block.
+                // sub_start fires automatically on first cycle (!sub_busy).
+                // Wait for sub_done, then capture result into aes_state.
                 // ─────────────────────────────────────────────────────────
-                S_ENCRYPT: begin
+                S_SUBBYTES: begin
+                    if (sub_done) begin
+                        aes_state <= sub_state_out;
+                        state     <= S_ROUND_OP;
+                    end
+                end
+
+                // ─────────────────────────────────────────────────────────
+                // S_ROUND_OP — apply ShiftRows + MixColumns/ARK
+                //
+                // aes_state holds SubBytes result.
+                // Combinational: shift_out = ShiftRows(aes_state)
+                //                mix_out   = MixColumns(shift_out)
+                //
+                // Rounds 1-9 (standard): aes_state = mix_out XOR rk
+                // Round 10  (final)    : ciphertext = shift_out XOR rk
+                // ─────────────────────────────────────────────────────────
+                S_ROUND_OP: begin
                     if (enc_ctr <= 4'd9) begin
-                        // Standard round: uses std_out = MixColumns(ShiftRows(SubBytes(aes_state))) XOR rk
-                        aes_state <= std_out;
-                        rk        <= next_rk;             // advance round key
+                        // Standard round: include MixColumns
+                        aes_state <= mix_out ^ rk;
+                        rk        <= next_rk;          // advance key
                         enc_ctr   <= enc_ctr + 4'd1;
+                        state     <= S_SUBBYTES;
+
                     end else begin
-                        // Final round (enc_ctr = 10):
-                        // uses final_out = ShiftRows(SubBytes(aes_state)) XOR rk  (no MixColumns)
-                        ciphertext_out <= final_out;
+                        // Final round (enc_ctr=10): no MixColumns
+                        ciphertext_out <= shift_out ^ rk;
                         valid_out      <= 1'b1;
-                        rk             <= orig_key;        // reset key for next block
+                        rk             <= orig_key;    // reset for next block
                         enc_ctr        <= 4'd0;
-                        state          <= S_READY;         // immediately ready for next block
+                        state          <= S_READY;
                     end
                 end
 
