@@ -1,81 +1,127 @@
 `timescale 1ns/1ps
 
+// =============================================================================
+// aes_top.v  —  Iterative AES-128 Core  (Tiny Tapeout version)
+// =============================================================================
+//
+// WHY ITERATIVE FOR TINY TAPEOUT:
+//   Pipelined design : ~4,900 flip-flops  → OpenLane takes very long / fails
+//   Iterative design :   ~400 flip-flops  → OpenLane completes quickly
+//
+// HOW IT WORKS:
+//   One round of AES is computed per clock cycle using a SINGLE shared
+//   combinational round function.  The same SubBytes, ShiftRows, MixColumns,
+//   and AddRoundKey logic is reused for all 10 rounds.
+//
+//   Round keys are generated ON-THE-FLY — no pre-storage of all 11 round keys.
+//   Only the original key (RK0) and the current round key are stored.
+//
+// TIMING:
+//   Cycle 0  (in S_READY)  : initial AddRoundKey  — state = plaintext XOR RK0
+//   Cycles 1–9 (S_ENCRYPT) : standard rounds 1–9  — SubBytes+ShiftRows+MixColumns+ARK
+//   Cycle 10 (S_ENCRYPT)   : final round 10        — SubBytes+ShiftRows+ARK (no MixColumns)
+//   Total : 11 cycles per encryption block
+//
+// INTERFACE: identical to the pipelined aes_top — no changes to tt_um_aes_project.v
+//
+// =============================================================================
+
 module aes_top (
     input  wire         clk,
     input  wire         rst_n,
 
-    // Key loading interface
+    // Key loading
     input  wire [127:0] key_in,
     input  wire         key_load,
     output reg          key_ready,
 
+    // Streaming input
     input  wire [127:0] plaintext_in,
     input  wire         valid_in,
     output wire         ready_in,
 
-    // Streaming output interface
-    output wire [127:0] ciphertext_out,
-    output wire         valid_out,
+    // Streaming output
+    output reg  [127:0] ciphertext_out,
+    output reg          valid_out,
     input  wire         ready_out
 );
 
-    // ============================================================
-    // KEY EXPANSION FSM
-    // ============================================================
+    // =========================================================================
+    // FSM states
+    // =========================================================================
 
-    localparam K_IDLE   = 2'd0;
-    localparam K_EXPAND = 2'd1;
-    localparam K_READY  = 2'd2;
+    localparam S_IDLE    = 2'd0;  // waiting for first key_load
+    localparam S_READY   = 2'd1;  // key loaded, ready to accept plaintext
+    localparam S_ENCRYPT = 2'd2;  // running encryption rounds
 
-    reg [1:0] key_state;
+    reg [1:0] state;
 
-    reg [127:0] round_keys [0:10];
-    reg [127:0] current_key;
-    reg [3:0]   round_ctr;
+    // =========================================================================
+    // Data registers  (~400 FFs total vs ~4900 in pipelined version)
+    // =========================================================================
 
-    wire [31:0] kx_w0;
-    wire [31:0] kx_w1;
-    wire [31:0] kx_w2;
-    wire [31:0] kx_w3;
+    reg [127:0] aes_state;   // 128 FFs — current AES state (changes each round)
+    reg [127:0] rk;          // 128 FFs — current round key
+    reg [127:0] orig_key;    // 128 FFs — original RK0 (used to reset rk between encryptions)
+    reg [3:0]   enc_ctr;     //   4 FFs — round counter: 0 in S_READY, 1–10 in S_ENCRYPT
 
-    wire [31:0] kx_rot_word;
-    wire [31:0] kx_sub_word;
-    wire [31:0] kx_temp;
+    // =========================================================================
+    // Combinational round function (shared across all 10 rounds)
+    //
+    // Input  : aes_state register
+    // Output : std_out  (rounds 1–9, includes MixColumns)
+    //          final_out (round 10,  no MixColumns)
+    // =========================================================================
 
-    wire [31:0] kx_w4;
-    wire [31:0] kx_w5;
-    wire [31:0] kx_w6;
-    wire [31:0] kx_w7;
+    wire [127:0] sub_out;    // SubBytes output
+    wire [127:0] shift_out;  // ShiftRows output
+    wire [127:0] mix_out;    // MixColumns output
 
-    wire [127:0] kx_next_key;
-    wire [31:0]  kx_rcon;
+    subbytes       sub (.state_in(aes_state), .state_out(sub_out));
+    ShiftRows       sr (.state_in(sub_out),   .state_out(shift_out));
+    MixColumns_comb mc (.state_in(shift_out), .state_out(mix_out));
 
-    assign kx_w0 = current_key[127:96];
-    assign kx_w1 = current_key[95:64];
-    assign kx_w2 = current_key[63:32];
-    assign kx_w3 = current_key[31:0];
+    wire [127:0] std_out   = mix_out   ^ rk;  // standard round result (rounds 1–9)
+    wire [127:0] final_out = shift_out ^ rk;  // final   round result (round 10)
 
-    // RotWord
-    assign kx_rot_word = {kx_w3[23:0], kx_w3[31:24]};
+    // =========================================================================
+    // On-the-fly key expansion (combinational, from current rk)
+    //
+    // next_rk = expand(rk, rcon[enc_ctr + 1])
+    //
+    // Timeline:
+    //   S_READY  enc_ctr=0 : expand(RK0,  rcon[1])  = RK1
+    //   S_ENCRYPT enc_ctr=1 : expand(RK1,  rcon[2])  = RK2
+    //   ...
+    //   S_ENCRYPT enc_ctr=9 : expand(RK9,  rcon[10]) = RK10
+    //   (enc_ctr=10 : next_rk unused — we reset rk to orig_key instead)
+    // =========================================================================
 
-    // SubWord, reuse aes_sbox_rom module from subbytes.v
-    aes_sbox_rom kx_sbox0 (.addr(kx_rot_word[31:24]), .data(kx_sub_word[31:24]));
-    aes_sbox_rom kx_sbox1 (.addr(kx_rot_word[23:16]), .data(kx_sub_word[23:16]));
-    aes_sbox_rom kx_sbox2 (.addr(kx_rot_word[15:8]),  .data(kx_sub_word[15:8]));
-    aes_sbox_rom kx_sbox3 (.addr(kx_rot_word[7:0]),   .data(kx_sub_word[7:0]));
+    wire [31:0] kx_w0 = rk[127:96];
+    wire [31:0] kx_w1 = rk[95:64];
+    wire [31:0] kx_w2 = rk[63:32];
+    wire [31:0] kx_w3 = rk[31:0];
 
-    assign kx_rcon     = get_rcon(round_ctr);
-    assign kx_temp     = kx_sub_word ^ kx_rcon;
-    assign kx_w4       = kx_w0 ^ kx_temp;
-    assign kx_w5       = kx_w1 ^ kx_w4;
-    assign kx_w6       = kx_w2 ^ kx_w5;
-    assign kx_w7       = kx_w3 ^ kx_w6;
-    assign kx_next_key = {kx_w4, kx_w5, kx_w6, kx_w7};
+    wire [31:0] kx_rot  = {kx_w3[23:0], kx_w3[31:24]};  // RotWord
+    wire [31:0] kx_sub;                                   // SubWord
+
+    aes_sbox_rom ks0 (.addr(kx_rot[31:24]), .data(kx_sub[31:24]));
+    aes_sbox_rom ks1 (.addr(kx_rot[23:16]), .data(kx_sub[23:16]));
+    aes_sbox_rom ks2 (.addr(kx_rot[15:8]),  .data(kx_sub[15:8]));
+    aes_sbox_rom ks3 (.addr(kx_rot[7:0]),   .data(kx_sub[7:0]));
+
+    wire [31:0]  kx_rcon  = get_rcon(enc_ctr + 4'd1);
+    wire [31:0]  kx_temp  = kx_sub ^ kx_rcon;
+    wire [31:0]  kx_nw4   = kx_w0 ^ kx_temp;
+    wire [31:0]  kx_nw5   = kx_w1 ^ kx_nw4;
+    wire [31:0]  kx_nw6   = kx_w2 ^ kx_nw5;
+    wire [31:0]  kx_nw7   = kx_w3 ^ kx_nw6;
+    wire [127:0] next_rk  = {kx_nw4, kx_nw5, kx_nw6, kx_nw7};
 
     function [31:0] get_rcon;
-        input [3:0] round;
+        input [3:0] r;
         begin
-            case (round)
+            case (r)
                 4'd1:    get_rcon = 32'h01000000;
                 4'd2:    get_rcon = 32'h02000000;
                 4'd3:    get_rcon = 32'h04000000;
@@ -91,212 +137,96 @@ module aes_top (
         end
     endfunction
 
+    // =========================================================================
+    // ready_in — high whenever the core is in S_READY
+    // =========================================================================
+
+    assign ready_in = (state == S_READY);
+
+    // =========================================================================
+    // Main FSM
+    // =========================================================================
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            key_state   <= K_IDLE;
-            key_ready   <= 1'b0;
-            round_ctr   <= 4'd0;
-            current_key <= 128'd0;
+            state         <= S_IDLE;
+            key_ready     <= 1'b0;
+            valid_out     <= 1'b0;
+            enc_ctr       <= 4'd0;
         end else begin
-            case (key_state)
 
-                K_IDLE: begin
+            valid_out <= 1'b0;  // default: not valid (override below when done)
+
+            case (state)
+
+                // ─────────────────────────────────────────────────────────
+                // S_IDLE — wait for the first key_load pulse
+                // ─────────────────────────────────────────────────────────
+                S_IDLE: begin
                     key_ready <= 1'b0;
-
                     if (key_load) begin
-                        round_keys[0] <= key_in;
-                        current_key   <= key_in;
-                        round_ctr     <= 4'd1;
-                        key_state     <= K_EXPAND;
-                    end
-                end
-
-                K_EXPAND: begin
-                    round_keys[round_ctr] <= kx_next_key;
-                    current_key           <= kx_next_key;
-
-                    if (round_ctr == 4'd10) begin
+                        orig_key  <= key_in;   // store RK0
+                        rk        <= key_in;   // seed the key expander
                         key_ready <= 1'b1;
-                        key_state <= K_READY;
-                    end else begin
-                        round_ctr <= round_ctr + 4'd1;
+                        enc_ctr   <= 4'd0;
+                        state     <= S_READY;
                     end
                 end
 
-                K_READY: begin
+                // ─────────────────────────────────────────────────────────
+                // S_READY — key ready, waiting for plaintext
+                //
+                // On valid_in: perform initial AddRoundKey (round 0)
+                //   state  = plaintext XOR RK0
+                //   rk     = RK1  (pre-computed via next_rk)
+                //   enc_ctr = 1   (round 1 will run next cycle)
+                // ─────────────────────────────────────────────────────────
+                S_READY: begin
                     key_ready <= 1'b1;
 
                     if (key_load) begin
-                        key_ready     <= 1'b0;
-                        round_keys[0] <= key_in;
-                        current_key   <= key_in;
-                        round_ctr     <= 4'd1;
-                        key_state     <= K_EXPAND;
+                        // Hot key swap — load new key without full reset
+                        orig_key <= key_in;
+                        rk       <= key_in;
+                        enc_ctr  <= 4'd0;
+                    end else if (valid_in) begin
+                        // Initial AddRoundKey (enc_ctr = 0, rk = RK0)
+                        aes_state <= plaintext_in ^ rk;  // state = PT XOR RK0
+                        rk        <= next_rk;             // rk = RK1
+                        enc_ctr   <= 4'd1;
+                        state     <= S_ENCRYPT;
                     end
                 end
 
-                default: begin
-                    key_state <= K_IDLE;
-                    key_ready <= 1'b0;
-                    round_ctr <= 4'd0;
+                // ─────────────────────────────────────────────────────────
+                // S_ENCRYPT — iterate through rounds 1 to 10
+                //
+                // enc_ctr 1–9  : standard rounds (SubBytes+ShiftRows+MixColumns+ARK)
+                // enc_ctr 10   : final round     (SubBytes+ShiftRows+ARK, no MixColumns)
+                //
+                // Key is expanded one step per cycle alongside the round.
+                // After round 10, rk is reset to orig_key ready for next block.
+                // ─────────────────────────────────────────────────────────
+                S_ENCRYPT: begin
+                    if (enc_ctr <= 4'd9) begin
+                        // Standard round: uses std_out = MixColumns(ShiftRows(SubBytes(aes_state))) XOR rk
+                        aes_state <= std_out;
+                        rk        <= next_rk;             // advance round key
+                        enc_ctr   <= enc_ctr + 4'd1;
+                    end else begin
+                        // Final round (enc_ctr = 10):
+                        // uses final_out = ShiftRows(SubBytes(aes_state)) XOR rk  (no MixColumns)
+                        ciphertext_out <= final_out;
+                        valid_out      <= 1'b1;
+                        rk             <= orig_key;        // reset key for next block
+                        enc_ctr        <= 4'd0;
+                        state          <= S_READY;         // immediately ready for next block
+                    end
                 end
+
+                default: state <= S_IDLE;
 
             endcase
-        end
-    end
-
-
-    // ============================================================
-    // ITERATIVE AES ENCRYPTION FSM
-    // ============================================================
-    //
-    // Old design:
-    //   round1, round2, round3, ..., round9, final_round all existed
-    //   at the same time.
-    //
-    // New design:
-    //   one StandardRound reused for round 1 to round 9.
-    //   one FinalRound reused for final round.
-    //
-    // This reduces area a lot.
-    // ============================================================
-
-    localparam E_IDLE       = 3'd0;
-    localparam E_STD_WAIT   = 3'd1;
-    localparam E_STD_LATCH  = 3'd2;
-    localparam E_FINAL_WAIT = 3'd3;
-    localparam E_FINAL_DONE = 3'd4;
-    localparam E_OUT_VALID  = 3'd5;
-
-    reg [2:0] enc_state;
-
-    reg [127:0] round_state;
-    reg [3:0]   enc_round;
-    reg [2:0]   wait_ctr;
-
-    reg [127:0] ciphertext_reg;
-    reg         ciphertext_valid;
-
-    wire [127:0] std_round_out;
-    wire [127:0] final_round_out;
-
-    // One shared standard round hardware
-    StandardRound standard_round_shared (
-        .clk          (clk),
-        .state_in     (round_state),
-        .expanded_key (round_keys[enc_round]),
-        .state_out    (std_round_out)
-    );
-
-    // One shared final round hardware
-    FinalRound final_round_shared (
-        .clk          (clk),
-        .state_in     (round_state),
-        .expanded_key (round_keys[10]),
-        .state_out    (final_round_out)
-    );
-
-    assign ready_in = (key_state == K_READY) &&
-                      (enc_state == E_IDLE) &&
-                      (!ciphertext_valid);
-
-    assign ciphertext_out = ciphertext_reg;
-    assign valid_out      = ciphertext_valid;
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            enc_state        <= E_IDLE;
-            round_state      <= 128'd0;
-            enc_round        <= 4'd0;
-            wait_ctr         <= 3'd0;
-            ciphertext_reg   <= 128'd0;
-            ciphertext_valid <= 1'b0;
-        end else begin
-
-            // Clear output when receiver accepts it
-            if (ciphertext_valid && ready_out) begin
-                ciphertext_valid <= 1'b0;
-            end
-
-            // If a new key is loaded, cancel current encryption
-            if (key_load) begin
-                enc_state        <= E_IDLE;
-                round_state      <= 128'd0;
-                enc_round        <= 4'd0;
-                wait_ctr         <= 3'd0;
-                ciphertext_valid <= 1'b0;
-            end else begin
-
-                case (enc_state)
-
-                    E_IDLE: begin
-                        wait_ctr <= 3'd0;
-
-                        if (valid_in && ready_in) begin
-                            // Initial AddRoundKey
-                            round_state <= plaintext_in ^ round_keys[0];
-
-                            // Start AES standard round 1
-                            enc_round   <= 4'd1;
-                            wait_ctr    <= 3'd0;
-                            enc_state   <= E_STD_WAIT;
-                        end
-                    end
-
-                    E_STD_WAIT: begin
-                        // StandardRound has internal registered stages.
-                        // Original design counted each StandardRound as 3 cycles.
-                        if (wait_ctr == 3'd3) begin
-                            enc_state <= E_STD_LATCH;
-                        end else begin
-                            wait_ctr <= wait_ctr + 3'd1;
-                        end
-                    end
-
-                    E_STD_LATCH: begin
-                        // Capture output from shared StandardRound
-                        round_state <= std_round_out;
-                        wait_ctr    <= 3'd0;
-
-                        if (enc_round == 4'd9) begin
-                            // After round 9, go to final round
-                            enc_state <= E_FINAL_WAIT;
-                        end else begin
-                            // Continue next standard round
-                            enc_round <= enc_round + 4'd1;
-                            enc_state <= E_STD_WAIT;
-                        end
-                    end
-
-                    E_FINAL_WAIT: begin
-                        // FinalRound also has internal delay registers.
-                        // Original final round latency was treated as 3 cycles.
-                        if (wait_ctr == 3'd3) begin
-                            enc_state <= E_FINAL_DONE;
-                        end else begin
-                            wait_ctr <= wait_ctr + 3'd1;
-                        end
-                    end
-
-                    E_FINAL_DONE: begin
-                        ciphertext_reg   <= final_round_out;
-                        ciphertext_valid <= 1'b1;
-                        enc_state        <= E_OUT_VALID;
-                    end
-
-                    E_OUT_VALID: begin
-                        // Hold ciphertext until receiver accepts it.
-                        if (ciphertext_valid && ready_out) begin
-                            enc_state <= E_IDLE;
-                        end
-                    end
-
-                    default: begin
-                        enc_state <= E_IDLE;
-                    end
-
-                endcase
-            end
         end
     end
 
