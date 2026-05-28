@@ -1,7 +1,7 @@
 // MixColumns_comb.v — COMBINATIONAL only (no pipeline registers, no clock)
 // Used in the BASELINE (v1) design to create a long critical path.
 
-module MixColumns_comb (
+module MixColumns (
     input  wire [127:0] state_in,
     output wire [127:0] state_out
 );
