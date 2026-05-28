@@ -1,0 +1,7 @@
+{
+    "DESIGN_NAME": "tt_um_aes_project",
+    "VERILOG_FILES": "dir::src/*.v",
+    "CLOCK_PORT": "clk",
+    "CLOCK_PERIOD": 100,
+    "DESIGN_IS_CORE": 0
+}
