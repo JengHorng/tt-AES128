@@ -13,13 +13,13 @@ project:
   top_module:  "tt_um_aes_project"
 
   # Source files must be inside ./src
-source_files:
-  - tt_um_aes_project.v
-  - aes_top.v
-  - addroundkey.v
-  - subbytes.v
-  - ShiftRows.v
-  - MixColumns.v
+  source_files:
+    - tt_um_aes_project.v
+    - aes_top.v
+    - addroundkey.v
+    - subbytes.v
+    - ShiftRows.v
+    - MixColumns.v
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 pinout:
