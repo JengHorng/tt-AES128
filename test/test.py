@@ -1,40 +1,34 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
-# SPDX-License-Identifier: Apache-2.0
-
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import RisingEdge
 
 
 @cocotb.test()
-async def test_project(dut):
-    dut._log.info("Start")
+async def test_aes_wrapper_basic(dut):
+    """Basic smoke test for Tiny Tapeout AES wrapper."""
 
-    # Set the clock period to 10 us (100 KHz)
-    clock = Clock(dut.clk, 10, unit="us")
-    cocotb.start_soon(clock.start())
+    dut._log.info("Starting AES Tiny Tapeout wrapper smoke test")
 
-    # Reset
-    dut._log.info("Reset")
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
+
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+
     dut.rst_n.value = 1
+    for _ in range(5):
+        await RisingEdge(dut.clk)
 
-    dut._log.info("Test project behavior")
+    assert int(dut.uio_oe.value) == 0x00
 
-    # Set the input values you want to test
-    dut.ui_in.value = 20
-    dut.uio_in.value = 30
+    # Write one key byte to check wrapper interface
+    dut.ui_in.value = 0x00
+    dut.uio_in.value = 0b0010_0000  # write_en=1, select_plaintext=0, index=0
+    await RisingEdge(dut.clk)
 
-    # Wait for one clock cycle to see the output values
-    await ClockCycles(dut.clk, 1)
+    dut.uio_in.value = 0
+    dut.ui_in.value = 0
+    await RisingEdge(dut.clk)
 
-    # The following assersion is just an example of how to check the output values.
-    # Change it to match the actual expected output of your module:
-    assert dut.uo_out.value == 50
-
-    # Keep testing the module by changing the input values, waiting for
-    # one or more clock cycles, and asserting the expected output values.
+    dut._log.info("AES wrapper basic smoke test passed")
