@@ -1,18 +1,6 @@
 # =============================================================================
 # test.py  —  cocotb testbench for tt_um_aes_project (iterative AES-128)
 # =============================================================================
-#
-# Tests the TT byte-serial wrapper using NIST FIPS 197 test vectors.
-#
-# uio_in pin mapping:
-#   [3:0] byte_index        — which byte to write (0=MSB, 15=LSB)
-#   [4]   select_plaintext  — 0=key, 1=plaintext
-#   [5]   write_en          — pulse to write ui_in byte
-#   [6]   load_key_cmd      — pulse to start key load
-#   [7]   start_cmd         — pulse to start encryption
-#
-# uo_out = current ciphertext byte (selected by byte_index)
-# =============================================================================
 
 import cocotb
 from cocotb.clock    import Clock
@@ -57,14 +45,20 @@ async def load_key_bytes(dut, key_hex):
     await RisingEdge(dut.clk)
     dut.uio_in.value = 0
 
-    # Wait for key to be ready (iterative design: 1-2 cycles)
-    for _ in range(5):
-        await RisingEdge(dut.clk)
-        await Timer(1, units="ns")
+    # Wait for FSM to transition to S_READY (2 cycles is enough)
+    await ClockCycles(dut.clk, 3)
 
 
-async def encrypt(dut, pt_hex, timeout=30):
-    """Write 16 plaintext bytes, start encryption, wait for valid_out."""
+async def encrypt(dut, pt_hex):
+    """
+    Write 16 plaintext bytes, pulse start_cmd, then wait fixed cycles.
+
+    Why fixed wait instead of polling done_latch:
+      uio_out is hardwired to 0 in tt_um_aes_project.v so done_latch
+      is not externally visible. We know the iterative design takes
+      exactly 11 cycles after valid_in fires, and valid_in fires 1
+      cycle after start_cmd. Total = 13 cycles. We wait 18 to be safe.
+    """
     pt_bytes = bytes.fromhex(pt_hex)
     assert len(pt_bytes) == 16
 
@@ -72,30 +66,27 @@ async def encrypt(dut, pt_hex, timeout=30):
     for i, b in enumerate(pt_bytes):
         await write_byte(dut, i, b, is_plaintext=True)
 
-    # Pulse start_cmd (uio_in[7])
+    # Pulse start_cmd (uio_in[7]) for 1 cycle
     dut.uio_in.value = (1 << 7)
     await RisingEdge(dut.clk)
     dut.uio_in.value = 0
 
-    # Wait for encryption to complete (iterative: 11 cycles)
-    for cycle in range(timeout):
-        await RisingEdge(dut.clk)
-        await Timer(1, units="ns")
-        # Check done_latch (uio_out[7]) — set by wrapper when valid_out fires
-        if (int(dut.uio_out.value) >> 7) & 1:
-            dut._log.info(f"Encryption done after {cycle + 1} cycles")
-            return True
-
-    dut._log.error(f"Encryption timeout after {timeout} cycles")
-    return False
+    # Fixed wait:
+    #   Cycle +1 : valid_in=1 latched by wrapper NBA, aes_top reads it
+    #   Cycle +2 : aes_top initial ARK (S_READY → S_ENCRYPT)
+    #   Cycles +3 to +11 : standard rounds 1–9
+    #   Cycle +12 : final round, valid_out=1, ciphertext_out updated
+    #   Cycle +13 : wrapper latches ciphertext_latch
+    #   Cycles +14–18 : margin
+    await ClockCycles(dut.clk, 18)
 
 
 async def read_ciphertext(dut):
-    """Read all 16 ciphertext bytes using byte_index."""
+    """Read all 16 ciphertext bytes by setting byte_index on uio_in[3:0]."""
     result = []
     for i in range(16):
-        dut.uio_in.value = i & 0xF    # set byte_index, no write_en
-        await Timer(2, units="ns")    # short settle
+        dut.uio_in.value = i & 0xF     # set byte_index, no write_en
+        await Timer(2, unit="ns")       # short combinational settle
         result.append(int(dut.uo_out.value) & 0xFF)
     dut.uio_in.value = 0
     return bytes(result)
@@ -111,23 +102,23 @@ async def test_nist_fips197_c1(dut):
       Plaintext : 00112233445566778899aabbccddeeff
       Expected  : 69c4e0d86a7b0430d8cdb78070b4c55a
     """
-    cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())  # 50 MHz
+    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
     await reset(dut)
 
     key_hex = "000102030405060708090a0b0c0d0e0f"
     pt_hex  = "00112233445566778899aabbccddeeff"
     exp_hex = "69c4e0d86a7b0430d8cdb78070b4c55a"
 
-    dut._log.info(f"Loading key: {key_hex}")
+    dut._log.info(f"Loading key : {key_hex}")
     await load_key_bytes(dut, key_hex)
 
-    dut._log.info(f"Encrypting:  {pt_hex}")
-    ok = await encrypt(dut, pt_hex)
-    assert ok, "Encryption did not complete within timeout"
+    dut._log.info(f"Encrypting  : {pt_hex}")
+    await encrypt(dut, pt_hex)
 
     ct = await read_ciphertext(dut)
-    dut._log.info(f"Got      : {ct.hex()}")
-    dut._log.info(f"Expected : {exp_hex}")
+    dut._log.info(f"Got         : {ct.hex()}")
+    dut._log.info(f"Expected    : {exp_hex}")
+
     assert ct.hex() == exp_hex, f"MISMATCH: got {ct.hex()}, expected {exp_hex}"
     dut._log.info("PASS — NIST FIPS 197 Appendix C.1")
 
@@ -140,7 +131,7 @@ async def test_nist_fips197_appb(dut):
       Plaintext : 3243f6a8885a308d313198a2e0370734
       Expected  : 3925841d02dc09fbdc118597196a0b32
     """
-    cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())  # 50 MHz
+    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
     await reset(dut)
 
     key_hex = "2b7e151628aed2a6abf7158809cf4f3c"
@@ -148,10 +139,12 @@ async def test_nist_fips197_appb(dut):
     exp_hex = "3925841d02dc09fbdc118597196a0b32"
 
     await load_key_bytes(dut, key_hex)
-    ok = await encrypt(dut, pt_hex)
-    assert ok, "Encryption did not complete"
+    await encrypt(dut, pt_hex)
 
     ct = await read_ciphertext(dut)
+    dut._log.info(f"Got         : {ct.hex()}")
+    dut._log.info(f"Expected    : {exp_hex}")
+
     assert ct.hex() == exp_hex, f"MISMATCH: {ct.hex()} != {exp_hex}"
     dut._log.info("PASS — NIST FIPS 197 Appendix B")
 
@@ -159,30 +152,30 @@ async def test_nist_fips197_appb(dut):
 @cocotb.test()
 async def test_second_encrypt_same_key(dut):
     """
-    Encrypt two blocks back to back with the same key.
-    Verifies key is correctly reset between encryptions.
-      Key       : 2b7e151628aed2a6abf7158809cf4f3c
-      Block 1 PT: 6bc1bee22e409f96e93d7e117393172a  → 3ad77bb40d7a3660a89ecaf32466ef97
-      Block 2 PT: ae2d8a571e03ac9c9eb76fac45af8e51  → f5d3d58503b9699de785895a96fdbaaf
+    Two consecutive encryptions with same key.
+    Verifies rk resets to orig_key between blocks.
+      Key    : 2b7e151628aed2a6abf7158809cf4f3c
+      Block1 : 6bc1bee22e409f96e93d7e117393172a → 3ad77bb40d7a3660a89ecaf32466ef97
+      Block2 : ae2d8a571e03ac9c9eb76fac45af8e51 → f5d3d58503b9699de785895a96fdbaaf
     """
-    cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
     await reset(dut)
 
     key_hex = "2b7e151628aed2a6abf7158809cf4f3c"
     await load_key_bytes(dut, key_hex)
 
     # Block 1
-    ok = await encrypt(dut, "6bc1bee22e409f96e93d7e117393172a")
-    assert ok
+    await encrypt(dut, "6bc1bee22e409f96e93d7e117393172a")
     ct1 = await read_ciphertext(dut)
-    assert ct1.hex() == "3ad77bb40d7a3660a89ecaf32466ef97", f"Block 1 FAIL: {ct1.hex()}"
-    dut._log.info(f"Block 1 PASS: {ct1.hex()}")
+    dut._log.info(f"Block 1 got : {ct1.hex()}")
+    assert ct1.hex() == "3ad77bb40d7a3660a89ecaf32466ef97", \
+           f"Block 1 FAIL: {ct1.hex()}"
+    dut._log.info("Block 1 PASS")
 
-    # Block 2 — same key, different plaintext
-    ok = await encrypt(dut, "ae2d8a571e03ac9c9eb76fac45af8e51")
-    assert ok
+    # Block 2 — same key, no key reload needed
+    await encrypt(dut, "ae2d8a571e03ac9c9eb76fac45af8e51")
     ct2 = await read_ciphertext(dut)
-    assert ct2.hex() == "f5d3d58503b9699de785895a96fdbaaf", f"Block 2 FAIL: {ct2.hex()}"
-    dut._log.info(f"Block 2 PASS: {ct2.hex()}")
-
-    dut._log.info("PASS — two consecutive encryptions with same key")
+    dut._log.info(f"Block 2 got : {ct2.hex()}")
+    assert ct2.hex() == "f5d3d58503b9699de785895a96fdbaaf", \
+           f"Block 2 FAIL: {ct2.hex()}"
+    dut._log.info("Block 2 PASS — key correctly reset between blocks")
