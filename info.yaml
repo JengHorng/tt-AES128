@@ -8,7 +8,7 @@ project:
   clock_hz:     10000000
 
   # Start with 1x1. If hardening fails due to area, increase this if allowed.
-  tiles: "1x1"
+  tiles: "4x2"
 
   top_module:  "tt_um_aes_project"
 
