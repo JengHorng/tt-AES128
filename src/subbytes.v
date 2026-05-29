@@ -1,19 +1,13 @@
 `timescale 1ns/1ps
 // =============================================================================
-// subbytes.v  —  Sequential AES SubBytes  (Tiny Tapeout version)
+// subbytes.v  —  AES S-box ROM definition only
 // =============================================================================
-// Contains two modules:
-//   1. aes_sbox_rom  — 256×8 AES S-box lookup table (1 instance shared)
-//   2. subbytes      — sequential controller (1 byte/cycle, 16 cycles total)
-//
-// Area vs original parallel version:
-//   Original : 16 aes_sbox_rom instances = ~12,800 sky130 cells
-//   This     :  1 aes_sbox_rom instance  =    ~800 sky130 cells  (16× smaller)
+// The SubBytes OPERATION is now inlined in aes_top.v for timing correctness.
+// This file provides the aes_sbox_rom module used by aes_top.v (5 instances):
+//   1 × dsbox  (data SubBytes, sequential via inlined logic)
+//   4 × ks0..ks3 (key expansion SubWord)
 // =============================================================================
 
-// ─────────────────────────────────────────────────────────────────────────────
-// aes_sbox_rom — AES forward S-box, 256 × 8-bit ROM
-// ─────────────────────────────────────────────────────────────────────────────
 module aes_sbox_rom (
     input  wire [7:0] addr,
     output wire [7:0] data
@@ -88,53 +82,18 @@ module aes_sbox_rom (
     assign data = sbox[addr];
 endmodule
 
-// ─────────────────────────────────────────────────────────────────────────────
-// subbytes — sequential SubBytes controller
-// Processes 1 byte per clock cycle using the shared aes_sbox_rom above.
-// Takes 16 cycles from start pulse to done pulse.
-// ─────────────────────────────────────────────────────────────────────────────
+// subbytes module stub — kept for compatibility but NOT instantiated by aes_top
+// aes_top.v inlines SubBytes directly using aes_sbox_rom
 module subbytes (
     input  wire         clk,
     input  wire         rst_n,
     input  wire         start,
     input  wire [127:0] state_in,
-    output reg  [127:0] state_out,
-    output reg          done,
-    output reg          busy
+    output wire [127:0] state_out,
+    output wire         done,
+    output wire         busy
 );
-    reg [127:0] shift_reg;
-    reg [3:0]   cnt;
-
-    wire [7:0] sbox_in  = shift_reg[127:120];
-    wire [7:0] sbox_out;
-    aes_sbox_rom rom (.addr(sbox_in), .data(sbox_out));
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            shift_reg <= 128'h0;
-            state_out <= 128'h0;
-            done      <= 1'b0;
-            busy      <= 1'b0;
-            cnt       <= 4'd0;
-        end else begin
-            done <= 1'b0;
-
-            if (start && !busy) begin
-                shift_reg <= state_in;
-                state_out <= 128'h0;
-                cnt       <= 4'd0;
-                busy      <= 1'b1;
-            end else if (busy) begin
-                shift_reg <= {shift_reg[119:0], 8'h00};
-                state_out <= {state_out[119:0], sbox_out};
-                if (cnt == 4'd15) begin
-                    done <= 1'b1;
-                    busy <= 1'b0;
-                    cnt  <= 4'd0;
-                end else begin
-                    cnt <= cnt + 4'd1;
-                end
-            end
-        end
-    end
+    assign state_out = state_in;
+    assign done      = 1'b0;
+    assign busy      = 1'b0;
 endmodule
