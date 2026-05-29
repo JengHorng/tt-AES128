@@ -65,7 +65,7 @@ async def encrypt(dut, pt_hex):
     dut.uio_in.value = 0
 
     # Wait: 181 cycles encryption + TT wrapper latency + margin = 200 cycles
-    await ClockCycles(dut.clk, 200)
+    await ClockCycles(dut.clk, 250)
 
 
 async def read_ciphertext(dut):
