@@ -1,144 +1,194 @@
 `timescale 1ns/1ps
 // =============================================================================
-// aes_top.v  —  AES-128 with ONE shared S-box (Tiny Tapeout, minimum area)
+// aes_top.v  —  AES-128 iterative core, S-box inline (Tiny Tapeout)
 // =============================================================================
-// ONE aes_sbox_rom instance for BOTH data SubBytes AND key expansion SubWord.
-// Area: ~800 (S-box) + ~500 (MixCols) + ~400 (other) ≈ 1,700 cells
+// S-box is a Verilog function (not a submodule) so it synthesises as part of
+// the sequential aes_top network — ABC never sees a standalone combinational
+// module and the "network is combinational" error cannot occur.
 //
-// Encryption timing (221 cycles total):
-//   Cycle 0        : initial AddRoundKey  (S_READY)
-//   Per round (×10): 20 cycles SubBytes+SubWord + 1 done + 1 S_ROUND = 22 cycles
-//   Total          : 1 + 10×22 = 221 cycles to valid_out
+// ONE S-box instance shared for both data SubBytes (16 bytes per round) AND
+// key-expansion SubWord (4 bytes per round).  Area ≈ 1,800 sky130 cells.
 //
-// Shared S-box schedule per round:
-//   sub_cnt  1-16 : S-box on 16 data bytes  → sub_accum (SubBytes result)
-//   sub_cnt 17-20 : S-box on 4 RotWord bytes → kx_accum  (SubWord result)
-//   sub_cnt 21    : done pulse, rk advanced to next round key
+// Encryption: 1 + 10×22 = 221 cycles from valid_in to valid_out.
 // =============================================================================
 
 module aes_top (
     input  wire         clk,
     input  wire         rst_n,
-
     input  wire [127:0] key_in,
     input  wire         key_load,
     output reg          key_ready,
-
     input  wire [127:0] plaintext_in,
     input  wire         valid_in,
     output wire         ready_in,
-
     output reg  [127:0] ciphertext_out,
     output reg          valid_out,
     input  wire         ready_out
 );
 
-    // ── FSM states ───────────────────────────────────────────────────────────
+    // ── AES S-box (256×8) as a pure function — synthesises inline ────────────
+    function [7:0] sbox;
+        input [7:0] x;
+        case (x)
+            8'h00:sbox=8'h63;8'h01:sbox=8'h7c;8'h02:sbox=8'h77;8'h03:sbox=8'h7b;
+            8'h04:sbox=8'hf2;8'h05:sbox=8'h6b;8'h06:sbox=8'h6f;8'h07:sbox=8'hc5;
+            8'h08:sbox=8'h30;8'h09:sbox=8'h01;8'h0a:sbox=8'h67;8'h0b:sbox=8'h2b;
+            8'h0c:sbox=8'hfe;8'h0d:sbox=8'hd7;8'h0e:sbox=8'hab;8'h0f:sbox=8'h76;
+            8'h10:sbox=8'hca;8'h11:sbox=8'h82;8'h12:sbox=8'hc9;8'h13:sbox=8'h7d;
+            8'h14:sbox=8'hfa;8'h15:sbox=8'h59;8'h16:sbox=8'h47;8'h17:sbox=8'hf0;
+            8'h18:sbox=8'had;8'h19:sbox=8'hd4;8'h1a:sbox=8'ha2;8'h1b:sbox=8'haf;
+            8'h1c:sbox=8'h9c;8'h1d:sbox=8'ha4;8'h1e:sbox=8'h72;8'h1f:sbox=8'hc0;
+            8'h20:sbox=8'hb7;8'h21:sbox=8'hfd;8'h22:sbox=8'h93;8'h23:sbox=8'h26;
+            8'h24:sbox=8'h36;8'h25:sbox=8'h3f;8'h26:sbox=8'hf7;8'h27:sbox=8'hcc;
+            8'h28:sbox=8'h34;8'h29:sbox=8'ha5;8'h2a:sbox=8'he5;8'h2b:sbox=8'hf1;
+            8'h2c:sbox=8'h71;8'h2d:sbox=8'hd8;8'h2e:sbox=8'h31;8'h2f:sbox=8'h15;
+            8'h30:sbox=8'h04;8'h31:sbox=8'hc7;8'h32:sbox=8'h23;8'h33:sbox=8'hc3;
+            8'h34:sbox=8'h18;8'h35:sbox=8'h96;8'h36:sbox=8'h05;8'h37:sbox=8'h9a;
+            8'h38:sbox=8'h07;8'h39:sbox=8'h12;8'h3a:sbox=8'h80;8'h3b:sbox=8'he2;
+            8'h3c:sbox=8'heb;8'h3d:sbox=8'h27;8'h3e:sbox=8'hb2;8'h3f:sbox=8'h75;
+            8'h40:sbox=8'h09;8'h41:sbox=8'h83;8'h42:sbox=8'h2c;8'h43:sbox=8'h1a;
+            8'h44:sbox=8'h1b;8'h45:sbox=8'h6e;8'h46:sbox=8'h5a;8'h47:sbox=8'ha0;
+            8'h48:sbox=8'h52;8'h49:sbox=8'h3b;8'h4a:sbox=8'hd6;8'h4b:sbox=8'hb3;
+            8'h4c:sbox=8'h29;8'h4d:sbox=8'he3;8'h4e:sbox=8'h2f;8'h4f:sbox=8'h84;
+            8'h50:sbox=8'h53;8'h51:sbox=8'hd1;8'h52:sbox=8'h00;8'h53:sbox=8'hed;
+            8'h54:sbox=8'h20;8'h55:sbox=8'hfc;8'h56:sbox=8'hb1;8'h57:sbox=8'h5b;
+            8'h58:sbox=8'h6a;8'h59:sbox=8'hcb;8'h5a:sbox=8'hbe;8'h5b:sbox=8'h39;
+            8'h5c:sbox=8'h4a;8'h5d:sbox=8'h4c;8'h5e:sbox=8'h58;8'h5f:sbox=8'hcf;
+            8'h60:sbox=8'hd0;8'h61:sbox=8'hef;8'h62:sbox=8'haa;8'h63:sbox=8'hfb;
+            8'h64:sbox=8'h43;8'h65:sbox=8'h4d;8'h66:sbox=8'h33;8'h67:sbox=8'h85;
+            8'h68:sbox=8'h45;8'h69:sbox=8'hf9;8'h6a:sbox=8'h02;8'h6b:sbox=8'h7f;
+            8'h6c:sbox=8'h50;8'h6d:sbox=8'h3c;8'h6e:sbox=8'h9f;8'h6f:sbox=8'ha8;
+            8'h70:sbox=8'h51;8'h71:sbox=8'ha3;8'h72:sbox=8'h40;8'h73:sbox=8'h8f;
+            8'h74:sbox=8'h92;8'h75:sbox=8'h9d;8'h76:sbox=8'h38;8'h77:sbox=8'hf5;
+            8'h78:sbox=8'hbc;8'h79:sbox=8'hb6;8'h7a:sbox=8'hda;8'h7b:sbox=8'h21;
+            8'h7c:sbox=8'h10;8'h7d:sbox=8'hff;8'h7e:sbox=8'hf3;8'h7f:sbox=8'hd2;
+            8'h80:sbox=8'hcd;8'h81:sbox=8'h0c;8'h82:sbox=8'h13;8'h83:sbox=8'hec;
+            8'h84:sbox=8'h5f;8'h85:sbox=8'h97;8'h86:sbox=8'h44;8'h87:sbox=8'h17;
+            8'h88:sbox=8'hc4;8'h89:sbox=8'ha7;8'h8a:sbox=8'h7e;8'h8b:sbox=8'h3d;
+            8'h8c:sbox=8'h64;8'h8d:sbox=8'h5d;8'h8e:sbox=8'h19;8'h8f:sbox=8'h73;
+            8'h90:sbox=8'h60;8'h91:sbox=8'h81;8'h92:sbox=8'h4f;8'h93:sbox=8'hdc;
+            8'h94:sbox=8'h22;8'h95:sbox=8'h2a;8'h96:sbox=8'h90;8'h97:sbox=8'h88;
+            8'h98:sbox=8'h46;8'h99:sbox=8'hee;8'h9a:sbox=8'hb8;8'h9b:sbox=8'h14;
+            8'h9c:sbox=8'hde;8'h9d:sbox=8'h5e;8'h9e:sbox=8'h0b;8'h9f:sbox=8'hdb;
+            8'ha0:sbox=8'he0;8'ha1:sbox=8'h32;8'ha2:sbox=8'h3a;8'ha3:sbox=8'h0a;
+            8'ha4:sbox=8'h49;8'ha5:sbox=8'h06;8'ha6:sbox=8'h24;8'ha7:sbox=8'h5c;
+            8'ha8:sbox=8'hc2;8'ha9:sbox=8'hd3;8'haa:sbox=8'hac;8'hab:sbox=8'h62;
+            8'hac:sbox=8'h91;8'had:sbox=8'h95;8'hae:sbox=8'he4;8'haf:sbox=8'h79;
+            8'hb0:sbox=8'he7;8'hb1:sbox=8'hc8;8'hb2:sbox=8'h37;8'hb3:sbox=8'h6d;
+            8'hb4:sbox=8'h8d;8'hb5:sbox=8'hd5;8'hb6:sbox=8'h4e;8'hb7:sbox=8'ha9;
+            8'hb8:sbox=8'h6c;8'hb9:sbox=8'h56;8'hba:sbox=8'hf4;8'hbb:sbox=8'hea;
+            8'hbc:sbox=8'h65;8'hbd:sbox=8'h7a;8'hbe:sbox=8'hae;8'hbf:sbox=8'h08;
+            8'hc0:sbox=8'hba;8'hc1:sbox=8'h78;8'hc2:sbox=8'h25;8'hc3:sbox=8'h2e;
+            8'hc4:sbox=8'h1c;8'hc5:sbox=8'ha6;8'hc6:sbox=8'hb4;8'hc7:sbox=8'hc6;
+            8'hc8:sbox=8'he8;8'hc9:sbox=8'hdd;8'hca:sbox=8'h74;8'hcb:sbox=8'h1f;
+            8'hcc:sbox=8'h4b;8'hcd:sbox=8'hbd;8'hce:sbox=8'h8b;8'hcf:sbox=8'h8a;
+            8'hd0:sbox=8'h70;8'hd1:sbox=8'h3e;8'hd2:sbox=8'hb5;8'hd3:sbox=8'h66;
+            8'hd4:sbox=8'h48;8'hd5:sbox=8'h03;8'hd6:sbox=8'hf6;8'hd7:sbox=8'h0e;
+            8'hd8:sbox=8'h61;8'hd9:sbox=8'h35;8'hda:sbox=8'h57;8'hdb:sbox=8'hb9;
+            8'hdc:sbox=8'h86;8'hdd:sbox=8'hc1;8'hde:sbox=8'h1d;8'hdf:sbox=8'h9e;
+            8'he0:sbox=8'he1;8'he1:sbox=8'hf8;8'he2:sbox=8'h98;8'he3:sbox=8'h11;
+            8'he4:sbox=8'h69;8'he5:sbox=8'hd9;8'he6:sbox=8'h8e;8'he7:sbox=8'h94;
+            8'he8:sbox=8'h9b;8'he9:sbox=8'h1e;8'hea:sbox=8'h87;8'heb:sbox=8'he9;
+            8'hec:sbox=8'hce;8'hed:sbox=8'h55;8'hee:sbox=8'h28;8'hef:sbox=8'hdf;
+            8'hf0:sbox=8'h8c;8'hf1:sbox=8'ha1;8'hf2:sbox=8'h89;8'hf3:sbox=8'h0d;
+            8'hf4:sbox=8'hbf;8'hf5:sbox=8'he6;8'hf6:sbox=8'h42;8'hf7:sbox=8'h68;
+            8'hf8:sbox=8'h41;8'hf9:sbox=8'h99;8'hfa:sbox=8'h2d;8'hfb:sbox=8'h0f;
+            8'hfc:sbox=8'hb0;8'hfd:sbox=8'h54;8'hfe:sbox=8'hbb;8'hff:sbox=8'h16;
+            default: sbox = 8'h00;
+        endcase
+    endfunction
+
+    // ── Rcon lookup ──────────────────────────────────────────────────────────
+    function [7:0] rcon;
+        input [3:0] r;
+        case (r)
+            4'd1:rcon=8'h01;4'd2:rcon=8'h02;4'd3:rcon=8'h04;4'd4:rcon=8'h08;
+            4'd5:rcon=8'h10;4'd6:rcon=8'h20;4'd7:rcon=8'h40;4'd8:rcon=8'h80;
+            4'd9:rcon=8'h1b;4'd10:rcon=8'h36;
+            default: rcon=8'h00;
+        endcase
+    endfunction
+
+    // ── FSM ──────────────────────────────────────────────────────────────────
     localparam S_IDLE  = 2'd0;
     localparam S_READY = 2'd1;
-    localparam S_SUB   = 2'd2;   // SubBytes (cnt 1-16) + SubWord (cnt 17-20)
-    localparam S_ROUND = 2'd3;   // ShiftRows + MixCols/ARK
+    localparam S_SUB   = 2'd2;
+    localparam S_ROUND = 2'd3;
 
     reg [1:0]   state;
-    reg [3:0]   enc_ctr;     // round counter 1..10
+    reg [3:0]   enc_ctr;
 
-    // ── AES registers ────────────────────────────────────────────────────────
+    // ── AES state / key registers ─────────────────────────────────────────────
     reg [127:0] aes_state;
     reg [127:0] rk;
     reg [127:0] orig_key;
 
-    // ── Single shared S-box ──────────────────────────────────────────────────
-    reg  [4:0]   sub_cnt;      // 0=idle, 1-16=data, 17-20=key, 21=done
+    // ── Sequential SubBytes + SubWord counter ─────────────────────────────────
+    // sub_cnt 1-16  : substitute data bytes  → sub_accum
+    // sub_cnt 17-20 : substitute key bytes   → kx_accum
+    // sub_cnt 21    : done
+    reg [4:0]   sub_cnt;
+    reg [127:0] sub_shift;   // rotates through state bytes
+    reg [127:0] sub_accum;   // builds SubBytes result
+    reg [31:0]  kx_shift;    // rotates through RotWord bytes
+    reg [31:0]  kx_accum;    // builds SubWord result
 
-    reg  [127:0] sub_shift;    // 128-bit shift reg: cycles through state bytes
-    reg  [127:0] sub_accum;    // accumulates SubBytes result (16 bytes)
-
-    reg  [31:0]  kx_shift;     // 32-bit shift reg: cycles through RotWord bytes
-    reg  [31:0]  kx_accum;     // accumulates SubWord result (4 bytes)
-
-    // S-box input MUX: data bytes (cnt 1-16) or key bytes (cnt 17-20)
     wire [7:0]  sbox_in  = (sub_cnt <= 5'd16) ? sub_shift[127:120]
                                                : kx_shift[31:24];
-    wire [7:0]  sbox_out;
-    aes_sbox_rom sbox (.addr(sbox_in), .data(sbox_out));
+    wire [7:0]  sbox_out = sbox(sbox_in);    // ← function call, inline
 
     wire sub_done = (sub_cnt == 5'd21);
 
-    // ── Next round key (combinational, uses kx_accum after SubWord) ──────────
-    // Called in done cycle: enc_ctr already holds the current round number
-    wire [31:0] kx_rcon = get_rcon(enc_ctr);
-    wire [31:0] kx_nw4  = rk[127:96] ^ kx_accum ^ kx_rcon;
-    wire [31:0] kx_nw5  = rk[95:64]  ^ kx_nw4;
-    wire [31:0] kx_nw6  = rk[63:32]  ^ kx_nw5;
-    wire [31:0] kx_nw7  = rk[31:0]   ^ kx_nw6;
+    // ── Next round key (combinational from kx_accum) ──────────────────────────
+    wire [31:0] kx_nw4 = rk[127:96] ^ kx_accum ^ {rcon(enc_ctr), 24'h0};
+    wire [31:0] kx_nw5 = rk[95:64]  ^ kx_nw4;
+    wire [31:0] kx_nw6 = rk[63:32]  ^ kx_nw5;
+    wire [31:0] kx_nw7 = rk[31:0]   ^ kx_nw6;
     wire [127:0] next_rk = {kx_nw4, kx_nw5, kx_nw6, kx_nw7};
 
-    function [31:0] get_rcon;
-        input [3:0] r;
-        begin
-            case (r)
-                4'd1:  get_rcon = 32'h01000000;
-                4'd2:  get_rcon = 32'h02000000;
-                4'd3:  get_rcon = 32'h04000000;
-                4'd4:  get_rcon = 32'h08000000;
-                4'd5:  get_rcon = 32'h10000000;
-                4'd6:  get_rcon = 32'h20000000;
-                4'd7:  get_rcon = 32'h40000000;
-                4'd8:  get_rcon = 32'h80000000;
-                4'd9:  get_rcon = 32'h1b000000;
-                4'd10: get_rcon = 32'h36000000;
-                default: get_rcon = 32'h00000000;
-            endcase
-        end
-    endfunction
-
-    // ── Combinational round transforms (applied in S_ROUND) ──────────────────
+    // ── Round transforms ──────────────────────────────────────────────────────
     wire [127:0] shift_out;
     wire [127:0] mix_out;
     ShiftRows  sr (.state_in(aes_state), .state_out(shift_out));
-    MixColumns mc (.state_in(shift_out),  .state_out(mix_out));
+    MixColumns mc (.state_in(shift_out), .state_out(mix_out));
 
     assign ready_in = (state == S_READY);
 
-    // ── Main FSM (all in one always block — no cross-module NBA races) ────────
+    // ── Single always block — no cross-module NBA races ───────────────────────
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state         <= S_IDLE;
-            key_ready     <= 1'b0;
-            valid_out     <= 1'b0;
-            enc_ctr       <= 4'd0;
-            sub_cnt       <= 5'd0;
-            aes_state     <= 128'h0;
-            rk            <= 128'h0;
-            orig_key      <= 128'h0;
-            ciphertext_out<= 128'h0;
-            sub_shift     <= 128'h0;
-            sub_accum     <= 128'h0;
-            kx_shift      <= 32'h0;
-            kx_accum      <= 32'h0;
+            state          <= S_IDLE;
+            key_ready      <= 1'b0;
+            valid_out      <= 1'b0;
+            enc_ctr        <= 4'd0;
+            sub_cnt        <= 5'd0;
+            aes_state      <= 128'h0;
+            rk             <= 128'h0;
+            orig_key       <= 128'h0;
+            ciphertext_out <= 128'h0;
+            sub_shift      <= 128'h0;
+            sub_accum      <= 128'h0;
+            kx_shift       <= 32'h0;
+            kx_accum       <= 32'h0;
         end else begin
             valid_out <= 1'b0;
 
-            // ── Shared S-box counter (runs autonomously) ─────────────────────
+            // Sub-counter (auto-runs once started)
             if (sub_cnt >= 5'd1 && sub_cnt <= 5'd20) begin
                 if (sub_cnt <= 5'd16) begin
-                    // Data SubBytes phase: shift state, accumulate result
                     sub_shift <= {sub_shift[119:0], 8'h00};
                     sub_accum <= {sub_accum[119:0], sbox_out};
                 end else begin
-                    // Key SubWord phase: shift key bytes, accumulate
-                    kx_shift  <= {kx_shift[23:0],  8'h00};
-                    kx_accum  <= {kx_accum[23:0],  sbox_out};
+                    kx_shift <= {kx_shift[23:0], 8'h00};
+                    kx_accum <= {kx_accum[23:0], sbox_out};
                 end
-                sub_cnt <= sub_cnt + 5'd1;   // 1→2→...→20→21
+                sub_cnt <= sub_cnt + 5'd1;
             end else if (sub_cnt == 5'd21) begin
-                sub_cnt <= 5'd0;             // done pulse → back to idle
+                sub_cnt <= 5'd0;
             end
-            // sub_cnt==0: idle, started by FSM below
 
-            // ── FSM ──────────────────────────────────────────────────────────
+            // FSM
             case (state)
-
                 S_IDLE: begin
                     key_ready <= 1'b0;
                     if (key_load) begin
@@ -157,13 +207,12 @@ module aes_top (
                         rk       <= key_in;
                         enc_ctr  <= 4'd0;
                     end else if (valid_in) begin
-                        // Initial ARK, then start SubBytes+SubWord
-                        sub_shift <= plaintext_in ^ rk;       // PT ^ RK0
+                        sub_shift <= plaintext_in ^ rk;
                         sub_accum <= 128'h0;
-                        kx_shift  <= {rk[23:0], rk[31:24]};   // RotWord(RK0[31:0])
+                        kx_shift  <= {rk[23:0], rk[31:24]};
                         kx_accum  <= 32'h0;
                         sub_cnt   <= 5'd1;
-                        aes_state <= plaintext_in ^ rk;        // keep copy
+                        aes_state <= plaintext_in ^ rk;
                         enc_ctr   <= 4'd1;
                         state     <= S_SUB;
                     end
@@ -171,31 +220,23 @@ module aes_top (
 
                 S_SUB: begin
                     if (sub_done) begin
-                        // sub_accum = SubBytes(aes_state)
-                        // kx_accum  = SubWord(RotWord(rk[31:0]))
-                        // next_rk computed combinationally from kx_accum + rk
-                        aes_state <= sub_accum;   // SubBytes result
-                        rk        <= next_rk;     // advance round key
+                        aes_state <= sub_accum;
+                        rk        <= next_rk;
                         state     <= S_ROUND;
                     end
                 end
 
                 S_ROUND: begin
-                    // aes_state = SubBytes result, rk = current round key
-                    // shift_out = ShiftRows(aes_state)  [combinational]
-                    // mix_out   = MixCols(shift_out)    [combinational]
                     if (enc_ctr <= 4'd9) begin
-                        // Standard round: ARK, start next SubBytes+SubWord
                         sub_shift <= mix_out ^ rk;
                         sub_accum <= 128'h0;
-                        kx_shift  <= {rk[23:0], rk[31:24]};  // RotWord(new rk[31:0])
+                        kx_shift  <= {rk[23:0], rk[31:24]};
                         kx_accum  <= 32'h0;
                         sub_cnt   <= 5'd1;
                         aes_state <= mix_out ^ rk;
                         enc_ctr   <= enc_ctr + 4'd1;
                         state     <= S_SUB;
                     end else begin
-                        // Final round (enc_ctr=10): ShiftRows + ARK, no MixCols
                         ciphertext_out <= shift_out ^ rk;
                         valid_out      <= 1'b1;
                         rk             <= orig_key;
